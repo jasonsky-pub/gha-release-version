@@ -1,0 +1,282 @@
+name: Release Version
+description: Calculate release metadata for publish workflows and fail on duplicate tags.
+
+inputs:
+  suffix:
+    description: Optional prerelease label for automatic releases, such as alpha. Mutually exclusive with specific-version.
+    required: false
+    default: ""
+  specific-version:
+    description: Specific SemVer 2.0.0 version to use without a leading v. Mutually exclusive with suffix.
+    required: false
+    default: ""
+
+outputs:
+  semantic_version:
+    description: Final semantic version without a leading v.
+    value: ${{ steps.release_metadata.outputs.semantic_version }}
+  release_tag:
+    description: Final Git tag including the leading v.
+    value: ${{ steps.release_metadata.outputs.release_tag }}
+  release_folder:
+    description: Temporary folder for release assets. The caller is responsible for cleanup.
+    value: ${{ steps.release_metadata.outputs.release_folder }}
+  is_prerelease:
+    description: Whether the release should be created as a prerelease.
+    value: ${{ steps.release_metadata.outputs.is_prerelease }}
+  all_versions:
+    description: Newline-separated version variants derived from the final semantic version.
+    value: ${{ steps.release_metadata.outputs.all_versions }}
+  extra_versions:
+    description: Newline-separated extra version aliases derived from the final semantic version.
+    value: ${{ steps.release_metadata.outputs.extra_versions }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate release inputs
+      shell: bash
+      env:
+        SUFFIX: ${{ inputs.suffix }}
+        SPECIFIC_VERSION: ${{ inputs['specific-version'] }}
+      run: |
+        set -euo pipefail
+        if [[ -n "$SUFFIX" && -n "$SPECIFIC_VERSION" ]]; then
+          echo "suffix and specific-version are mutually exclusive." >&2
+          exit 1
+        fi
+
+    - name: Fetch release tags
+      shell: bash
+      run: |
+        set -euo pipefail
+        git fetch --force --tags origin
+
+    - name: Calculate semantic version
+      if: ${{ inputs['specific-version'] == '' }}
+      id: semantic_version
+      uses: paulhatch/semantic-version@v5.4.0
+      with:
+        tag_prefix: "v"
+        version_format: "${major}.${minor}.${patch}"
+        major_pattern: "/!:|BREAKING CHANGE:/"
+        minor_pattern: "/feat(\\(.+\\))?:/"
+
+    - name: Format release metadata
+      id: release_metadata
+      shell: bash
+      env:
+        SUFFIX: ${{ inputs.suffix }}
+        SPECIFIC_VERSION: ${{ inputs['specific-version'] }}
+        CALCULATED_SEMANTIC_VERSION: ${{ steps.semantic_version.outputs.version }}
+        IS_CURRENT_COMMIT_TAGGED: ${{ steps.semantic_version.outputs.is_tagged }}
+      run: |
+        set -euo pipefail
+        release_folder="$(mktemp -d "${RUNNER_TEMP}/release.XXXXXX")"
+        export RELEASE_FOLDER="${release_folder}"
+        python - <<'PY'
+        import os
+        import re
+        import subprocess
+        import sys
+
+        suffix = os.environ.get("SUFFIX", "")
+        specific_version = os.environ.get("SPECIFIC_VERSION", "")
+        calculated_semantic_version = os.environ.get("CALCULATED_SEMANTIC_VERSION", "")
+
+        # Official SemVer 2.0.0 regex from https://semver.org/#is-there-a-suggested-regular-expression-regex-to-check-a-semver-string
+        semver_regex = r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$"
+
+        def base_tuple(match):
+            return (
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+            )
+
+        def base_string(version_base):
+            return ".".join(str(part) for part in version_base)
+
+        def increment_patch(version_base):
+            return (version_base[0], version_base[1], version_base[2] + 1)
+
+        def parse_tag(tag_name):
+            if not tag_name.startswith("v"):
+                return None
+            tag_match = re.fullmatch(semver_regex, tag_name[1:])
+            if tag_match is None:
+                return None
+            return {
+                "name": tag_name,
+                "base": base_tuple(tag_match),
+                "prerelease": tag_match.group(4),
+            }
+
+        all_tags = [
+            parsed_tag
+            for parsed_tag in (
+                parse_tag(tag.strip())
+                for tag in subprocess.run(
+                    ["git", "tag", "--list", "v*"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+            )
+            if parsed_tag is not None
+        ]
+        head_tags = [
+            parsed_tag
+            for parsed_tag in (
+                parse_tag(tag.strip())
+                for tag in subprocess.run(
+                    ["git", "tag", "--points-at", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.splitlines()
+            )
+            if parsed_tag is not None
+        ]
+
+        if specific_version:
+            semantic_version = specific_version
+        else:
+            match = re.fullmatch(semver_regex, calculated_semantic_version)
+            if match is None:
+                print(
+                    "Calculated semantic_version must be a valid Semantic Version 2.0.0 string without a leading v.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            automatic_base = base_tuple(match)
+            stable_head_bases = [
+                parsed_tag["base"]
+                for parsed_tag in head_tags
+                if parsed_tag["prerelease"] is None
+            ]
+            if stable_head_bases:
+                automatic_base = max(
+                    automatic_base,
+                    increment_patch(max(stable_head_bases)),
+                )
+
+            prerelease_bases = [
+                parsed_tag["base"]
+                for parsed_tag in all_tags
+                if parsed_tag["prerelease"] is not None
+            ]
+            if prerelease_bases:
+                automatic_base = max(automatic_base, max(prerelease_bases))
+
+            automatic_version = base_string(automatic_base)
+            if suffix:
+                suffix_tag_pattern = re.compile(
+                    rf"^v{re.escape(automatic_version)}-{re.escape(suffix)}(?:\.(0|[1-9]\d*))?$"
+                )
+                suffix_index = 0
+                for parsed_tag in all_tags:
+                    suffix_match = suffix_tag_pattern.fullmatch(parsed_tag["name"])
+                    if suffix_match is None:
+                        continue
+                    if suffix_match.group(1) is None:
+                        suffix_index = max(suffix_index, 0)
+                    else:
+                        suffix_index = max(suffix_index, int(suffix_match.group(1)))
+                semantic_version = f"{automatic_version}-{suffix}.{suffix_index + 1}"
+            else:
+                semantic_version = automatic_version
+
+        match = re.fullmatch(semver_regex, semantic_version)
+        if match is None:
+            print(
+                "semantic_version must be a valid Semantic Version 2.0.0 string without a leading v.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        major = match.group(1)
+        minor = match.group(2)
+        patch = match.group(3)
+        prerelease = match.group(4)
+        build = match.group(5)
+
+        full_suffix_value = ""
+        if prerelease:
+            full_suffix_value += f"-{prerelease}"
+        if build:
+            full_suffix_value += f"+{build}"
+
+        alias_suffix_value = ""
+        if prerelease:
+            alias_suffix_value += f"-{prerelease.split('.', 1)[0]}"
+        if build:
+            alias_suffix_value += f"+{build}"
+
+        all_versions = "\n".join(
+            [
+                f"{major}.{minor}.{patch}{full_suffix_value}",
+                f"{major}.{minor}{alias_suffix_value}",
+                f"{major}{alias_suffix_value}",
+            ]
+        )
+        extra_version_suffix = ""
+        if prerelease:
+            extra_version_suffix = f"-{prerelease.split('.', 1)[0]}"
+        extra_versions = "\n".join(
+            [
+                f"v{major}.{minor}{extra_version_suffix}",
+                f"v{major}{extra_version_suffix}",
+            ]
+        )
+        is_prerelease = "true" if prerelease else "false"
+        if specific_version:
+            selection_source = "specific-version"
+        elif suffix:
+            selection_source = f"automatic prerelease ({suffix})"
+        else:
+            selection_source = "automatic stable"
+ 
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as github_output:
+            github_output.write(f"semantic_version={semantic_version}\n")
+            github_output.write(f"release_tag=v{semantic_version}\n")
+            github_output.write(f"release_folder={os.environ['RELEASE_FOLDER']}\n")
+            github_output.write(f"is_prerelease={is_prerelease}\n")
+            github_output.write("all_versions<<EOF\n")
+            github_output.write(f"{all_versions}\n")
+            github_output.write("EOF\n")
+            github_output.write("extra_versions<<EOF\n")
+            github_output.write(f"{extra_versions}\n")
+            github_output.write("EOF\n")
+
+        print(f"::notice title=Final release version::{semantic_version}")
+        print(f"::notice title=Final release tag::v{semantic_version}")
+        print("Final release contract:")
+        print(f"  Selection source: {selection_source}")
+        if specific_version:
+            print(f"  Requested specific version: {specific_version}")
+        print(f"  Semantic version: {semantic_version}")
+        print(f"  Release tag: v{semantic_version}")
+        print(f"  Prerelease: {is_prerelease}")
+        print("  all_versions:")
+        for version in all_versions.splitlines():
+            if version:
+                print(f"    - {version}")
+        print("  extra_versions:")
+        for version in extra_versions.splitlines():
+            if version:
+                print(f"    - {version}")
+        PY
+
+    - name: Validate release tag is unused on origin
+      shell: bash
+      env:
+        RELEASE_TAG: ${{ steps.release_metadata.outputs.release_tag }}
+      run: |
+        set -euo pipefail
+        if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+          echo "Release tag ${RELEASE_TAG} already exists on origin." >&2
+          echo "Choose a different release version or correct the remote tag history before publishing." >&2
+          exit 1
+        fi
